@@ -1,0 +1,448 @@
+package name.uddhav.springframework.web.servlet.view;
+
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+import org.codehaus.jackson.JsonEncoding;
+import org.codehaus.jackson.map.ObjectMapper;
+import org.springframework.util.CollectionUtils;
+import org.springframework.validation.BindingResult;
+import org.springframework.web.servlet.view.AbstractView;
+
+/**
+ * Based on MappingJSONView
+ * Generate Lua Tables
+ * @author uddhav kambli
+ */
+public class MappingLuaView extends AbstractView {
+	/**
+	 * Default content type. 
+	 */
+	public static final String DEFAULT_CONTENT_TYPE = "text/x-lua";
+	
+	/**
+	 * Default content encoding
+	 */
+	public static final String DEFAULT_CONTENT_ENCODING = "UTF-8";
+	
+	/**
+	 * Integer & decimal numbers
+	 */
+	private static final Pattern numberPattern = Pattern.compile("[\\-]?[0-9]+(\\.[0-9]+)?");
+	
+	/**
+	 * Regular escape characters
+	 */
+	private static final Pattern pattern = Pattern.compile("(\\\\|\"|'|\\[|\\])");
+    
+	/**
+	 * Magic escape characters
+	 */
+    private static final Pattern magicPattern = Pattern.compile("(\n)|(\r)|(\t)|(\b)|(\f)");
+    
+    /**
+     * Magic escape characters mapped
+     */
+    private static final Map<String, String> magicChars;
+    
+    static {
+    	magicChars = new HashMap<String, String>();
+    	magicChars.put("\n", "\\n");
+    	magicChars.put("\r", "\\r");
+    	magicChars.put("\t", "\\t");
+    	magicChars.put("\b", "\\b");
+    	magicChars.put("\f", "\\f");
+    }
+	
+	/**
+	 * Custom Object Mapper
+	 * To serialize Model objects
+	 */
+	private ObjectMapper objectMapper = new ObjectMapper();
+	
+	/**
+	 * Keep certain attributes.
+	 */
+	private Set<String> renderedAttributes;
+	
+	/**
+	 * Content Encoding
+	 */
+	private String encoding;
+	
+	/**
+	 * Serialize integers as strings
+	 */
+	private boolean integerAsString;
+	
+	/**
+	 * Serialize decimals as strings
+	 */
+	private boolean decimalAsString;
+	
+	/**
+	 * Default content type and content encoding
+	 */
+	public MappingLuaView() {
+		setContentType(DEFAULT_CONTENT_TYPE);
+		setEncoding(DEFAULT_CONTENT_ENCODING);
+		integerAsString = false;
+		decimalAsString = true;		
+	}
+	
+	/**
+	 * Sets the {@code ObjectMapper} for this view. If not set, a default {@link ObjectMapper#ObjectMapper() ObjectMapper}
+	 * is used.
+	 */
+	public void setObjectMapper(ObjectMapper objectMapper) {
+		if (objectMapper != null)
+			this.objectMapper = objectMapper;
+	}
+
+	/**
+	 * Sets the {@code JsonEncoding} for this converter. By default, {@linkplain JsonEncoding#UTF8 UTF-8} is used.
+	 */
+	public void setEncoding(String encoding) {
+		if (encoding != null && encoding.length() > 0)
+			this.encoding = encoding;
+		else 
+			this.encoding = "UTF-8";
+	}
+
+	
+	/**
+	 * Sets the attributes in the model that should be rendered by this view. When set, all other model attributes will be
+	 * ignored.
+	 */
+	public void setRenderedAttributes(Set<String> renderedAttributes) {
+		this.renderedAttributes = renderedAttributes;
+	}
+
+	
+	public void setIntegerAsString(boolean integerAsString) {
+		this.integerAsString = integerAsString;
+	}
+
+	public void setDecimalAsString(boolean decimalAsString) {
+		this.decimalAsString = decimalAsString;
+	}
+
+	@Override
+	protected void prepareResponse(HttpServletRequest request, HttpServletResponse response) {
+		response.setContentType(getContentType());
+		response.setCharacterEncoding(encoding);
+	}
+
+	/**
+	 * Render the Lua Table
+	 * TODO: Generics need to support check type casting. That one's for Sun.
+	 * @param model POJOs
+	 * @param request Request object
+	 * @param response Response Object
+	 * @throws Exception
+	 */
+	@Override
+	@SuppressWarnings("rawtypes")
+	protected void renderMergedOutputModel(Map<String, Object> model,
+			HttpServletRequest request, HttpServletResponse response)
+			throws Exception {
+		Map<String, Object> objectMap = filterModel(model);
+		
+		// Have a valid model
+		if (objectMap != null) {
+			// Lua allows multiple return objects.
+			// We will use that to return multiple model attributes. 
+			List<String> returnVars = new ArrayList<String>();
+			
+			// Content buffer
+			StringBuilder content = new StringBuilder();
+			
+			// Loop all attributes in the model
+			for (Map.Entry<String, Object> param : objectMap.entrySet()) {
+				// An attribute name
+				Object object = param.getValue();
+				
+				// Don't serialize null object, leads to ugly and bloated output
+				if (object != null) {
+					// Map the object, literally!
+					Map map = objectMapper.convertValue(object, Map.class);
+					
+					// Declare lua variable
+					content.append("local ");
+					content.append(param.getKey());
+					content.append("={");
+					
+					// Serialize the attribute value to lua table format.
+					serializeMapToLua(content, map);					
+					closeLuaContainer(content);
+					
+					// Flush out the content.
+					//writer.append(content.toString());					
+					content.append(";");
+					
+					// Add the attribute name to return variables list.
+					returnVars.add(param.getKey());					
+				}
+			}
+			
+			// Return all the declared local lua tables
+			content.append("return ");
+			
+			boolean firstGo = true;
+			for (String returnVar : returnVars) {
+				if (!firstGo) 
+					content.append(",");
+				else
+					firstGo = false;
+				
+				content.append(returnVar);
+			}
+			
+			content.append(";");
+			
+			// And we are done!
+			// Some lua consumers like fios need Content length
+			ByteArrayOutputStream output = createTemporaryOutputStream();
+			output.write(content.toString().getBytes());
+			output.flush();
+			
+			writeToResponse(response, output);
+			
+			output.close();
+		}
+	}
+	
+	/**
+	 * Serialize map to lua
+	 * @param writer
+	 * @param map
+	 * @return
+	 */
+	@SuppressWarnings({ "rawtypes", , "unchecked" })
+	private void serializeMapToLua(StringBuilder writer, Map map) {
+		Map<String, Object> model = (Map<String, Object>)map;
+		
+		// Loop through all the model objects
+		for (Map.Entry<String, Object> name : model.entrySet()) {
+			Object value = name.getValue();
+			
+			if (value instanceof Map) { // We have another map, recurse!
+				serializeMap(writer, name.getKey(), value);
+			} else if (value instanceof List) { // We have a list
+				serializeList(writer, name.getKey(), value);
+			} else if (value != null) { // We have a value, finally!
+				serializeValue(writer, name.getKey(), value);
+			}
+		}
+	}
+	
+	/**
+	 * Serialize a list to Lua
+	 * A list can have either a map or another list. Handle it!
+	 * @param writer
+	 * @param listObject
+	 */
+	@SuppressWarnings("rawtypes")
+	private void serializeListToLua(StringBuilder writer, List listObject) {
+		for (Object map : listObject) {
+			// Is this a map?
+			if (map instanceof Map) {
+				Map model = (Map)map;
+				
+				// Loop through all the objects in the map
+				for (Object entry : model.entrySet()) {
+					Map.Entry name = (Map.Entry)entry;
+					Object value = name.getValue();
+					
+					if (value instanceof Map) { // We have a map!
+						serializeMap(writer, name.getKey(), value); 
+					} else if (value instanceof List) { // We have another list, recurse!
+						serializeList(writer, name.getKey(), value);
+					} else if (value != null) { // We have a value, finally!
+						serializeValue(writer, name.getKey(), value);
+					}
+				} 
+				
+			}
+			// Is this a list? If yes, then let the sister method handle it
+			else if (map instanceof List) {
+				serializeListToLua(writer, (List)map);
+			}
+		}
+	}
+	
+	/**
+	 * Escape special lua characters
+	 * @param valueOf
+	 * @return
+	 */
+	private static String escapeSpecialCharacters(String value) {
+		StringBuilder builder = new StringBuilder(value);
+		
+		// First match regular escape characters
+		Matcher matcher = pattern.matcher(value);
+		
+		int start = 0;
+		int offset = 0;
+		
+		while (matcher.find(start)) {
+		    start = matcher.start();
+		    builder.insert(start + offset, '\\');
+		    offset = offset + 1;
+		    start = start + 1;
+		}
+		
+		// Reset
+		start = 0;
+		offset = 0;
+		
+		// Now match magic escape characters.
+		matcher = magicPattern.matcher(builder.toString());
+		
+		while (matcher.find(start)) {
+		    start = matcher.start();
+		    
+		    builder.deleteCharAt(start + offset);
+		    builder.insert(start + offset, magicChars.get(matcher.group()));
+		    offset = offset + 1;
+		    start = start + 1;
+		}
+		
+		return builder.toString();
+	}
+
+	/**
+	 * Serialize a value
+	 * @param writer
+	 * @param name
+	 * @param value
+	 */
+	private void serializeValue(StringBuilder writer, Object name, Object value) {
+		// Serialize name if it exists
+		if (name != null) {
+			writer.append(String.valueOf(name));
+			writer.append("=");
+		}
+		
+		String rhs = String.valueOf(value);
+		
+		// Emit numbers as numbers, except for a few cases
+		if (!integerAsString && numberPattern.matcher(rhs).matches()) {
+			Matcher matcher = numberPattern.matcher(rhs);
+			
+			matcher.find();
+			
+			if (decimalAsString && matcher.group(1) != null) {
+				writer.append("\"");
+				writer.append(value);
+				writer.append("\"");
+			} else {
+				writer.append(value);
+			}
+		} else {
+			writer.append("\"");
+			writer.append(escapeSpecialCharacters(rhs));
+			writer.append("\"");
+		}
+		
+		writer.append(",");
+	}
+
+	/**
+	 * Serialize a list
+	 * @param writer
+	 * @param name
+	 * @param value
+	 */
+	@SuppressWarnings("rawtypes")
+	private void serializeList(StringBuilder writer, Object name, Object value) {
+		List list = (List)value;
+		int size = list.size();
+		
+		if (size > 0) {
+			writer.append(String.valueOf(name));
+			writer.append("={");
+			
+			for (Object listObject : list) {
+				if (listObject instanceof Map) {
+					writer.append("{");
+					serializeMapToLua(writer, (Map)listObject);
+					closeLuaContainer(writer);					
+					writer.append(",");
+				} else if (listObject instanceof List) { 
+					writer.append("{");
+					serializeListToLua(writer, (List)listObject);
+					closeLuaContainer(writer);					
+					writer.append(",");
+				} else if (listObject != null) {
+					serializeValue(writer, null, listObject);
+				}
+			}
+			
+			closeLuaContainer(writer);
+			
+			writer.append(",");
+		}
+	}
+
+	/** 
+	 * Serialize a map
+	 * @param writer
+	 * @param name
+	 * @param value
+	 */
+	@SuppressWarnings("rawtypes")
+	private void serializeMap(StringBuilder writer, Object name, Object value) {
+		writer.append(String.valueOf(name));
+		writer.append("={");
+		serializeMapToLua(writer, (Map)value);
+		closeLuaContainer(writer);
+		writer.append(",");
+	}
+
+	/**
+	 * Checks if there is lagging , if yes then delete it.
+	 * Append } after that.
+	 * @param writer
+	 */
+	private void closeLuaContainer(StringBuilder writer) {
+		int lastCharIndex = writer.length() - 1;
+		
+		if (lastCharIndex >= 0 && writer.charAt(lastCharIndex) == ',')
+			writer.deleteCharAt(lastCharIndex);
+		
+		writer.append('}');
+	}
+
+	/**
+	 * Filters out undesired attributes from the given model. The return value can be either another {@link Map}, or a
+	 * single value object.
+	 *
+	 * <p>Default implementation removes {@link BindingResult} instances and entries not included in the {@link
+	 * #setRenderedAttributes(Set) renderedAttributes} property.
+	 *
+	 * @param model the model, as passed on to {@link #renderMergedOutputModel}
+	 * @return the object to be rendered
+	 */
+	protected Map<String, Object> filterModel(Map<String, Object> model) {
+		Map<String, Object> result = new HashMap<String, Object>(model.size());
+		Set<String> renderedAttributes =
+				!CollectionUtils.isEmpty(this.renderedAttributes) ? this.renderedAttributes : model.keySet();
+		for (Map.Entry<String, Object> entry : model.entrySet()) {
+			if (!(entry.getValue() instanceof BindingResult) && renderedAttributes.contains(entry.getKey())) {
+				result.put(entry.getKey(), entry.getValue());
+			}
+		}
+		return result;
+	}
+
+}
